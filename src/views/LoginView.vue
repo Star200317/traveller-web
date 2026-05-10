@@ -78,6 +78,10 @@
                 >
                   登 录
                 </el-button>
+
+                <div class="forget-password-row">
+                  <span class="forget-link" @click="forgetPasswordRef.open()">忘记密码？</span>
+                </div>
               </el-form>
             </el-tab-pane>
 
@@ -144,6 +148,9 @@
         </div>
       </div>
     </div>
+
+    <!-- 忘记密码弹窗 -->
+    <ForgetPassword ref="forgetPasswordRef" />
   </div>
 </template>
 
@@ -153,6 +160,7 @@ import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { ElMessage } from 'element-plus'
 import { User, Lock, Avatar } from '@element-plus/icons-vue'
+import ForgetPassword from '@/components/ForgetPassword.vue'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -160,6 +168,7 @@ const activeTab = ref('login')
 const loading = ref(false)
 const loginForm = ref({ username: '', password: '' })
 const regForm = ref({ username: '', password: '', nickname: '' })
+const forgetPasswordRef = ref(null)
 
 async function handleLogin() {
   if (!loginForm.value.username || !loginForm.value.password) {
@@ -488,6 +497,24 @@ async function handleRegister() {
 .form-footer p {
   font-size: 13px;
   color: #999;
+}
+
+/* 忘记密码 */
+.forget-password-row {
+  text-align: right;
+  margin-top: -8px;
+  margin-bottom: 8px;
+}
+
+.forget-link {
+  font-size: 14px;
+  color: #667eea;
+  cursor: pointer;
+  transition: color 0.3s;
+}
+
+.forget-link:hover {
+  color: #764ba2;
 }
 
 /* 响应式设计 */

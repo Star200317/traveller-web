@@ -69,11 +69,11 @@
             <div class="card-body">
               <div class="stat-grid">
                 <div class="stat-item">
-                  <span class="stat-number">{{ mapData.markers?.length || 0 }}</span>
+                  <span class="stat-number">{{ attractionCount }}</span>
                   <span class="stat-label">景点总数</span>
                 </div>
                 <div class="stat-item">
-                  <span class="stat-number">{{ mapData.polylines?.length || 0 }}</span>
+                  <span class="stat-number">{{ dayList.length }}</span>
                   <span class="stat-label">行程天数</span>
                 </div>
               </div>
@@ -81,7 +81,7 @@
           </div>
 
           <!-- 天数筛选 -->
-          <div class="info-card filter-card" v-if="mapData?.polylines?.length > 0">
+          <div class="info-card filter-card" v-if="dayList.length > 0">
             <div class="card-header">
               <el-icon><Filter /></el-icon>
               <span>天数筛选</span>
@@ -89,15 +89,15 @@
             <div class="card-body">
               <div class="day-filters">
                 <div 
-                  v-for="pl in mapData.polylines" 
-                  :key="pl.day"
+                  v-for="day in dayList" 
+                  :key="day.day"
                   class="day-filter-item"
-                  :class="{ active: selectedDay === pl.day }"
-                  :style="{ borderColor: pl.color }"
-                  @click="toggleDayFilter(pl.day)"
+                  :class="{ active: selectedDay === day.day }"
+                  :style="{ borderColor: day.color }"
+                  @click="toggleDayFilter(day.day)"
                 >
-                  <span class="day-dot" :style="{ background: pl.color }"></span>
-                  <span>第 {{ pl.day }} 天</span>
+                  <span class="day-dot" :style="{ background: day.color }"></span>
+                  <span>第 {{ day.day }} 天</span>
                 </div>
               </div>
             </div>
@@ -126,7 +126,7 @@
       <!-- 地图区域 -->
       <div class="map-container">
         <MapView 
-          v-if="mapData && mapData.markers?.length > 0" 
+          v-if="filteredMapData && filteredMapData.markers?.length > 0" 
           :mapData="filteredMapData" 
         />
         
@@ -153,6 +153,9 @@
             <el-button @click="goBack" type="primary">返回生成路线</el-button>
           </el-empty>
         </div>
+
+        <!-- 调试按钮 -->
+        <div class="debug-fab" @click="showRawData = true" title="查看原始数据">🐛</div>
       </div>
     </div>
   </div>
@@ -197,6 +200,50 @@ const rawData = ref(null)
 const sidebarCollapsed = ref(false)
 const selectedDay = ref(null)
 
+// 前端内存缓存：避免同一 planId 重复请求后端
+const mapDataCache = new Map()
+
+// 从后端拿到 plan 数据后，处理 mapData
+function processPlanData(plan) {
+  if (!plan) {
+    return { markers: [], polylines: [] }
+  }
+  
+  console.log('[MapPage] 原始 plan 数据:', JSON.stringify({
+    id: plan.id,
+    hasMapData: !!plan.mapData,
+    mapDataType: typeof plan.mapData,
+    mapDataKeys: plan.mapData ? Object.keys(plan.mapData) : [],
+    hasPlanContent: !!plan.planContent,
+    planContentType: typeof plan.planContent,
+    planContentKeys: plan.planContent ? Object.keys(plan.planContent) : [],
+    daysCount: plan.planContent?.days?.length ?? 'N/A'
+  }, null, 2))
+
+  if (plan.mapData && Array.isArray(plan.mapData.markers) && plan.mapData.markers.length > 0) {
+    // 后端已生成有效 mapData，直接使用（最快路径）
+    console.log('[MapPage] ✅ 使用后端已存储的 mapData, markers=', plan.mapData.markers.length)
+    return plan.mapData
+  }
+  
+  // 后端 mapData 为空或无效，尝试前端实时解析 planContent
+  if (plan.planContent) {
+    console.log('[MapPage] ⚠️ 后端 mapData 无效，尝试前端解析 planContent')
+    const built = buildMapDataFromContent(plan.planContent)
+    console.log('[MapPage] 前端解析结果: markers=', built.markers.length, 'polylines=', built.polylines.length)
+    
+    // 如果前端解析也失败（markers=0），尝试从 planContent 文本中提取表格数据
+    if (built.markers.length === 0 && typeof plan.planContent === 'object') {
+      console.log('[MapPage] 标准解析无结果，尝试深度提取...')
+      return deepExtractMapData(plan.planContent)
+    }
+    
+    return built
+  }
+  
+  return { markers: [], polylines: [] }
+}
+
 // 根据筛选条件过滤地图数据
 const filteredMapData = computed(() => {
   if (!mapData.value) return null
@@ -209,6 +256,26 @@ const filteredMapData = computed(() => {
   }
 })
 
+// 去重天数列表（polylines 每天有多段路线，去重后每天只显示一次）
+const dayList = computed(() => {
+  if (!mapData.value?.polylines) return []
+  const seen = new Set()
+  const result = []
+  for (const pl of mapData.value.polylines) {
+    if (!seen.has(pl.day)) {
+      seen.add(pl.day)
+      result.push({ day: pl.day, color: pl.color })
+    }
+  }
+  return result
+})
+
+// 景点总数（只统计 type=attraction 的标记，不含酒店和餐食）
+const attractionCount = computed(() => {
+  if (!mapData.value?.markers) return 0
+  return mapData.value.markers.filter(m => m.type === 'attraction').length
+})
+
 onMounted(() => {
   loadMapData()
 })
@@ -217,6 +284,17 @@ async function loadMapData() {
   loading.value = true
   error.value = false
   try {
+    // 命中缓存，直接返回（同一会话内不重复请求）
+    if (mapDataCache.has(planId.value)) {
+      console.log('[MapPage] 命中前端缓存，直接使用 planId=' + planId.value)
+      const cached = mapDataCache.get(planId.value)
+      mapData.value = cached.mapData
+      planTitle.value = cached.title
+      planInfo.value = cached.planInfo
+      rawData.value = cached.raw
+      return
+    }
+
     const plan = await request.get(`/plan/${planId.value}`)
     console.log('[MapPage] 计划数据:', plan)
     rawData.value = plan
@@ -233,13 +311,18 @@ async function loadMapData() {
       budget: plan.budget || 0
     }
 
-    if (plan.mapData) {
-      mapData.value = plan.mapData
-    } else if (plan.planContent) {
-      mapData.value = buildMapDataFromContent(plan.planContent)
-    } else {
-      mapData.value = { markers: [], polylines: [] }
-    }
+    // 使用 processPlanData 统一处理，优先用后端 mapData
+    const processed = processPlanData(plan)
+    mapData.value = processed
+
+    // 写入缓存
+    mapDataCache.set(planId.value, {
+      mapData: processed,
+      title: planTitle.value,
+      planInfo: planInfo.value,
+      raw: rawData.value
+    })
+    console.log('[MapPage] 已写入前端缓存, planId=' + planId.value)
   } catch (err) {
     console.error('[MapPage] 加载失败:', err)
     rawData.value = { error: err.message }
@@ -251,31 +334,72 @@ async function loadMapData() {
 
 function buildMapDataFromContent(content) {
   if (!content || !content.days) return { markers: [], polylines: [] }
-  
+
   const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD']
   const markers = []
   const polylines = []
-  
+
   content.days.forEach((day, dayIdx) => {
     const color = colors[dayIdx % colors.length]
     const activities = day.activities || day.attractions || []
     const points = []
-    
+
+    // 支持两种字段名：latitude/longitude (AI原始) 或 lat/lng (后端转换后)
     activities.forEach((act, actIdx) => {
-      if (act.latitude && act.longitude) {
+      const lat = act.lat || act.latitude
+      const lng = act.lng || act.longitude
+      if (lat && lng && lat !== 0 && lng !== 0) {
         markers.push({
           day: day.day || dayIdx + 1,
           order: actIdx + 1,
           name: act.name,
-          lat: act.latitude,
-          lng: act.longitude,
+          lat: lat,
+          lng: lng,
           address: act.address || '',
           description: act.description || '',
-          color: color
+          color: color,
+          type: 'attraction'
         })
-        points.push({ lat: act.latitude, lng: act.longitude })
+        points.push({ lat: lat, lng: lng })
+      } else {
+        console.log(`[MapPage] 跳过无坐标景点: ${act?.name}, lat=${lat}, lng=${lng}`)
       }
     })
+
+    // 餐食也作为标记点
+    ;(day.meals || []).forEach((meal) => {
+      const mLat = meal.lat || meal.latitude
+      const mLng = meal.lng || meal.longitude
+      if (mLat && mLng && mLat !== 0 && mLng !== 0) {
+        markers.push({
+          day: day.day || dayIdx + 1,
+          order: 999,
+          name: meal.name,
+          lat: mLat, lng: mLng,
+          address: meal.address || '',
+          color: color,
+          type: 'meal'
+        })
+      }
+    })
+
+    // 酒店
+    const hotel = day.hotel
+    if (hotel?.name) {
+      const hLat = hotel.lat || hotel.latitude
+      const hLng = hotel.lng || hotel.longitude
+      if (hLat && hLng && hLat !== 0 && hLng !== 0) {
+        markers.push({
+          day: day.day || dayIdx + 1,
+          order: 0,
+          name: hotel.name + ' (酒店)',
+          lat: hLat, lng: hLng,
+          address: hotel.address || '',
+          color: '#8B5CF6',
+          type: 'hotel'
+        })
+      }
+    }
     
     if (points.length > 1) {
       polylines.push({
@@ -285,7 +409,56 @@ function buildMapDataFromContent(content) {
       })
     }
   })
+
+  return { markers, polylines }
+}
+
+/**
+ * 深度提取：从 planContent 的各种嵌套格式中尝试提取坐标数据
+ * 兜底方案：当标准解析返回空结果时调用
+ */
+function deepExtractMapData(content) {
+  if (!content) return { markers: [], polylines: [] }
+
+  const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD']
+  const markers = []
+  const polylines = []
+
+  const days = content.days || content.data || content.plan || []
   
+  days.forEach((day, dayIdx) => {
+    const color = colors[dayIdx % colors.length]
+    const dayNum = day.day || day.dayIndex || dayIdx + 1
+
+    // 尝试多个可能的字段名来获取活动列表
+    const activities = day.activities || day.attractions || day.items || day.spots || day.places ||
+      (Array.isArray(day) ? day : [])
+    
+    let linePoints = []
+
+    activities.forEach((item, idx) => {
+      if (!item?.name) return
+      
+      const lat = item.lat || item.latitude || item.y
+      const lng = item.lng || item.longitude || item.x
+
+      if (lat && lng && lat !== 0 && lng !== 0) {
+        markers.push({
+          day: dayNum, order: idx + 1, name: item.name,
+          address: item.address || '', description: item.description || item.introduction || '',
+          time: item.time || item.timeRange || '',
+          lat, lng, color, type: 'attraction'
+        })
+        linePoints.push({ lat, lng, name: item.name })
+      }
+    })
+
+    if (linePoints.length > 1) {
+      polylines.push({ day: dayNum, color, points: linePoints })
+    }
+  })
+
+  console.log('[MapPage] 深度提取结果: markers=', markers.length, ', polylines=', polylines.length)
   return { markers, polylines }
 }
 
@@ -664,6 +837,30 @@ function shareMap() {
   max-height: 500px;
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* 调试悬浮按钮 */
+.debug-fab {
+  position: absolute;
+  bottom: 24px;
+  right: 24px;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: white;
+  font-size: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 200;
+  transition: all 0.3s;
+  user-select: none;
+}
+.debug-fab:hover {
+  background: rgba(0, 0, 0, 0.8);
+  transform: scale(1.1);
 }
 
 /* 响应式 */

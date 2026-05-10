@@ -115,25 +115,43 @@
             <div class="message-content">
               <div class="message-header">
                 <span class="sender-name">旅小智</span>
-                <span class="typing-indicator">
+                <span class="typing-indicator" v-if="!isPlanOutput">
                   <span></span><span></span><span></span>
                 </span>
               </div>
-              <div class="bubble" v-html="renderMarkdown(streamBuffer)" />
+
+              <!-- 普通对话：继续流式显示 -->
+              <div v-if="!isPlanOutput" class="bubble" v-html="renderMarkdown(streamBuffer)" />
+
+              <!-- 行程计划输出：显示加载动画，完成后一次性渲染 -->
+              <div v-else class="bubble plan-loading-bubble">
+                <div class="plan-loading">
+                  <div class="plan-loading-icon">✈️</div>
+                  <div class="plan-loading-text">
+                    <span class="plan-loading-title">正在为您规划行程</span>
+                    <span class="plan-loading-hint">{{ planLoadingHint }}</span>
+                  </div>
+                  <div class="plan-loading-dots">
+                    <span></span><span></span><span></span><span></span><span></span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
         <!-- 地图预览（内嵌） -->
-        <div v-if="currentMapData" class="embedded-map">
-          <div class="map-header">
-            <span class="map-title">📍 旅游路线图</span>
-            <el-button type="primary" link @click="openFullMap">查看完整地图</el-button>
+        <Transition name="map-fade">
+          <div v-if="currentMapData" class="embedded-map" ref="embeddedMapRef">
+            <div class="map-header">
+              <span class="map-title">📍 旅游路线图</span>
+              <el-button type="primary" link @click="openFullMap">查看完整地图</el-button>
+            </div>
+            <div class="map-preview">
+              <MapView :mapData="currentMapData" :ready="mapReady" />
+            </div>
           </div>
-          <div class="map-preview">
-            <MapView :mapData="currentMapData" />
-          </div>
-        </div>
+        </Transition>
       </div>
 
       <!-- 输入框 -->
@@ -173,9 +191,17 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick, watch } from 'vue'
+import { ref, onMounted, nextTick, watch, computed } from 'vue'
 import { Plus, Delete, ChatDotRound, Compass, Share, Setting, Promotion } from '@element-plus/icons-vue'
+import { ElMessageBox, ElMessage } from 'element-plus'
 import { marked } from 'marked'
+
+// 配置marked支持GFM表格
+marked.setOptions({
+  gfm: true,  // 启用GitHub Flavored Markdown（包含表格支持）
+  breaks: true,  // 支持GFM换行
+  tables: true   // 显式启用表格支持
+})
 import { useUserStore } from '@/stores/user'
 import request from '@/utils/request'
 import MapView from '@/components/MapView.vue'
@@ -191,6 +217,12 @@ const streaming = ref(false)
 const streamBuffer = ref('')
 const msgListRef = ref(null)
 const currentMapData = ref(null)
+const embeddedMapRef = ref(null)  // 内嵌地图容器引用
+const mapReady = ref(false)        // 地图容器是否已就绪（尺寸>0）
+
+// 行程计划块输出相关
+const isPlanOutput = computed(() => detectPlanOutput(streamBuffer.value))
+const planLoadingHint = ref('正在搜索景点和美食推荐...')
 
 const quickPrompts = [
   '帮我规划一个厦门三日游',
@@ -224,11 +256,25 @@ async function switchConversation(convId) {
 }
 
 async function deleteConversation(convId) {
-  await request.delete(`/chat/conversation/${convId}`)
-  conversations.value = conversations.value.filter(c => c.id !== convId)
-  if (currentConvId.value === convId) {
-    currentConvId.value = null
-    messages.value = []
+  try {
+    await ElMessageBox.confirm('确定要删除这个对话吗？', '提示', {
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  try {
+    await request.delete(`/chat/conversation/${convId}`)
+    conversations.value = conversations.value.filter(c => c.id !== convId)
+    if (currentConvId.value === convId) {
+      currentConvId.value = null
+      messages.value = []
+    }
+    ElMessage.success('对话已删除')
+  } catch (err) {
+    ElMessage.error('删除失败：' + (err.message || err))
   }
 }
 
@@ -256,24 +302,196 @@ async function sendMessage() {
 
   streaming.value = true
   streamBuffer.value = ''
+  startPlanLoadingHints()  // 启动行程加载提示（如果是计划输出会显示）
 
-  // SSE 流式接收
-  const url = `/api/chat/stream/${currentConvId.value}?message=${encodeURIComponent(query)}`
-  const eventSource = new EventSource(url)
+  await fetchWithRetry(query)
+}
 
-  eventSource.onmessage = (e) => {
-    streamBuffer.value += e.data
-    scrollToBottom()
+async function fetchWithRetry(query, maxRetries = 3) {
+  let lastError = null
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const url = `/api/chat/stream/${currentConvId.value}?message=${encodeURIComponent(query)}`
+      const response = await fetch(url)
+
+      if (!response.ok) {
+        throw new Error(`请求失败: ${response.status}`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let sseBuffer = '' // SSE缓冲区
+
+      while (true) {
+        const { done, value } = await reader.read()
+        
+        // 解码当前chunk
+        sseBuffer += decoder.decode(value, { stream: !done })
+        
+        if (done) {
+          // 流结束，处理剩余缓冲区
+          processSSEBuffer(sseBuffer)
+          break
+        }
+        
+        // 按SSE协议分割消息（以\n\n分隔）
+        const messages = sseBuffer.split('\n\n')
+        // 最后一段可能不完整，保留到下次
+        sseBuffer = messages.pop() || ''
+        
+        // 处理所有完整的SSE消息
+        for (const msg of messages) {
+          processSSEMessage(msg)
+        }
+        
+        scrollToBottom()
+      }
+
+      // 流式完成，保存消息
+      stopPlanLoadingHints()  // 停止加载提示
+      messages.value.push({ role: 'assistant', content: streamBuffer.value, id: Date.now() })
+      streamBuffer.value = ''
+      streaming.value = false
+      scrollToBottom()
+      checkMapData()
+      return // 成功，直接返回
+
+    } catch (error) {
+      lastError = error
+      console.error(`[Chat] 第 ${attempt + 1} 次请求失败:`, error)
+
+      if (attempt < maxRetries - 1) {
+        const waitTime = (attempt + 1) * 2000 // 2s, 4s, 6s
+        // 显示重试提示
+        streamBuffer.value += `\n\n⚡ 网络不稳定，第 ${attempt + 2} 次重试中...\n`
+        scrollToBottom()
+        await new Promise(resolve => setTimeout(resolve, waitTime))
+        // 清掉重试提示
+        streamBuffer.value = streamBuffer.value.replace(/\n\n⚡.*重试中\.\.\.\n$/, '')
+      }
+    }
   }
 
-  eventSource.addEventListener('error', () => {
-    eventSource.close()
-    messages.value.push({ role: 'assistant', content: streamBuffer.value, id: Date.now() })
-    streamBuffer.value = ''
-    streaming.value = false
-    scrollToBottom()
-    checkMapData()
+  // 所有重试都失败
+  stopPlanLoadingHints()  // 停止加载提示
+  const errorMsg = lastError?.message || '网络错误'
+  messages.value.push({
+    role: 'assistant',
+    content: `❌ 网络连接失败：${errorMsg}\n\n请检查网络后重试，或稍后再试。如果问题持续存在，可能是 DashScope 服务繁忙。`,
+    id: Date.now()
   })
+  streamBuffer.value = ''
+  streaming.value = false
+  scrollToBottom()
+}
+
+// 处理SSE消息（解析data:前缀）
+function processSSEMessage(msg) {
+  const trimmed = msg.trim()
+  if (!trimmed || trimmed === ':heartbeat') return
+
+  // 解析SSE格式：data: 真实内容
+  if (trimmed.startsWith('data:')) {
+    let data = trimmed.slice(5).trim() // 去掉"data:"前缀
+
+    // SSE可能有多行data字段，需要拼接（处理多行data拼接情况）
+    if (data.includes('\ndata:')) {
+      data = data.split('\ndata:').join('\n')
+    }
+
+    // 跳过[DONE]结束标记
+    if (data === '[DONE]') return
+
+    // 追加到流缓冲区
+    streamBuffer.value += data
+  } else if (trimmed && !trimmed.startsWith('id:') && !trimmed.startsWith('event:') && !trimmed.startsWith('retry:')) {
+    // 兼容：有些SSE实现不严格带data:前缀，直接追加内容（排除其他SSE字段）
+    streamBuffer.value += trimmed
+  }
+}
+
+/**
+ * 清理流式文本中的残留 SSE 协议字符
+ * 解决 TCP 分片导致 data: 等前缀泄漏到渲染内容的问题
+ */
+function cleanStreamText(text) {
+  if (!text) return ''
+  // 1. 移除行首/行中残留的 data: 前缀（带空格或不带空格）
+  let cleaned = text.replace(/\bdata:\s*/g, '')
+  // 2. 移除可能的 [DONE] 标记残留
+  cleaned = cleaned.replace(/\[DONE\]/g, '')
+  // 3. 清理多余的空行（连续2个以上换行变成1个）
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n')
+  return cleaned
+}
+
+/**
+ * 修复流式传输中的不完整 Markdown 表格
+ * 流式过程中表格可能缺少表头、分隔符或最后一行，
+ * 导致 marked() 无法解析而显示为原始 pipe 文本。
+ * 此函数检测并临时补全表格结构，使渲染正确。
+ */
+function repairStreamingTables(text) {
+  if (!text) return ''
+
+  const lines = text.split('\n')
+
+  // 检测是否存在表格语法（至少有 | 符号的行）
+  const hasTableSyntax = lines.some(line => line.includes('|') && line.trim().startsWith('|'))
+
+  if (!hasTableSyntax) return text
+
+  const result = []
+  let inTable = false
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const isTableRow = line.trim().startsWith('|') && line.includes('|')
+
+    if (isTableRow) {
+      if (!inTable) {
+        // 新表格开始，检查是否有表头+分隔符
+        inTable = true
+        result.push(line)
+
+        // 如果下一行不是分隔符行（---|---），且当前行看起来像表头（含中文/字母表头）
+        const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : ''
+        const looksLikeHeader = /[\u4e00-\u9fa5]|[a-zA-Z]/.test(line)
+        const nextIsSeparator = /^[\s|:-]+$/.test(nextLine)
+
+        if (looksLikeHeader && !nextIsSeparator) {
+          // 自动补充分隔符行：根据当前行的列数生成 ---|---
+          const colCount = (line.match(/\|/g) || []).length - 1
+          const separator = '|' + ' --- |'.repeat(colCount)
+          result.push(separator)
+        }
+      } else {
+        result.push(line)
+      }
+    } else {
+      if (inTable) {
+        inTable = false
+      }
+      result.push(line)
+    }
+  }
+
+  // 处理：如果还在表格内部结束（最后几行是表格行但没闭合），
+  // 不需要特殊处理，marked 可以处理没有空行结尾的表格
+  return result.join('\n')
+}
+
+// 处理SSE缓冲区剩余内容
+function processSSEBuffer(buf) {
+  if (!buf.trim()) return
+  
+  const messages = buf.split('\n\n')
+  for (const msg of messages) {
+    if (msg.trim()) {
+      processSSEMessage(msg)
+    }
+  }
 }
 
 async function checkMapData() {
@@ -282,15 +500,67 @@ async function checkMapData() {
     if (plans && plans.length > 0) {
       const latest = plans[0]
       if (latest.mapData) {
+        // 先重置 ready 状态，让 MapView 等待容器就绪
+        mapReady.value = false
         currentMapData.value = latest.mapData
+        // 延迟检测容器尺寸，确保 DOM 已完成布局
+        await nextTick()
+        waitForMapContainer()
       }
     }
   } catch (e) { /* ignore */ }
 }
 
-function openFullMap() {
-  if (currentConvId.value) {
-    router.push(`/map/${currentConvId.value}`)
+/**
+ * 等待内嵌地图容器具有有效尺寸后再通知 MapView 初始化地图
+ * 解决：v-if 切换后容器尺寸为 0，导致高德地图瓦片请求全部被取消
+ */
+function waitForMapContainer() {
+  const el = embeddedMapRef.value?.querySelector('.map-preview')
+  if (!el) {
+    // 容器还没渲染，再等一帧
+    setTimeout(() => waitForMapContainer(), 50)
+    return
+  }
+
+  // 检查容器是否已有有效尺寸
+  if (el.offsetWidth > 0 && el.offsetHeight > 0) {
+    mapReady.value = true
+    return
+  }
+
+  // 用 ResizeObserver 监听容器尺寸变化（处理 CSS transition/动画导致的延迟）
+  const observer = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.contentRect.width > 0 && entry.contentRect.height > 0) {
+        observer.disconnect()
+        mapReady.value = true
+        break
+      }
+    }
+  })
+  observer.observe(el)
+
+  // 兜底：最多等 2 秒后强制就绪（防止某些情况下 observer 不触发）
+  setTimeout(() => {
+    observer.disconnect()
+    if (!mapReady.value) {
+      mapReady.value = true
+    }
+  }, 2000)
+}
+
+async function openFullMap() {
+  if (!currentConvId.value) return
+  try {
+    const plan = await request.get(`/plan/byConv/${currentConvId.value}`)
+    if (plan && plan.id) {
+      router.push(`/map/${plan.id}`)
+    } else {
+      ElMessage.warning('该对话还没有生成旅游计划')
+    }
+  } catch (e) {
+    ElMessage.error('获取计划失败')
   }
 }
 
@@ -302,6 +572,63 @@ function openSettings() {
   // 设置功能
 }
 
+/**
+ * 检测当前流式内容是否为行程计划输出
+ * 判定标准：
+ * 1. 包含表格管道符 | 且有中文表头（时间/景点/花费等）
+ * 2. 或包含 "第N天行程" 标记
+ */
+function detectPlanOutput(text) {
+  if (!text) return false
+  // 包含 markdown 表格 + 行程相关关键词 → 计划输出模式
+  const hasTablePipe = text.includes('|') && /\|.*时间/.test(text)
+  const hasDayMarker = /第\d+天行程/.test(text)
+  return hasTablePipe || hasDayMarker
+}
+
+// 行程规划阶段的加载提示文案，按阶段动态切换
+const PLAN_LOADING_STAGES = [
+  '正在搜索景点和美食推荐...',
+  '正在查询高德地图坐标...',
+  '正在规划每日路线安排...',
+  '正在优化行程时间节点...',
+  '即将生成完整行程表...'
+]
+let planLoadingStage = 0
+let planLoadingTimer = null
+
+/**
+ * 启动行程加载提示轮换
+ * 在 sendMessage 开始时调用
+ */
+function startPlanLoadingHints() {
+  planLoadingStage = 0
+  planLoadingHint.value = PLAN_LOADING_STAGES[0]
+
+  // 每 3 秒切换一个提示，模拟 AI 正在工作的不同阶段
+  if (planLoadingTimer) clearInterval(planLoadingTimer)
+  planLoadingTimer = setInterval(() => {
+    planLoadingStage++
+    if (planLoadingStage < PLAN_LOADING_STAGES.length) {
+      planLoadingHint.value = PLAN_LOADING_STAGES[planLoadingStage]
+    } else {
+      // 循环到最后几个提示
+      planLoadingHint.value = '马上就好，请稍候...'
+    }
+  }, 3000)
+}
+
+/**
+ * 停止加载提示轮换
+ * 在流式结束时调用
+ */
+function stopPlanLoadingHints() {
+  if (planLoadingTimer) {
+    clearInterval(planLoadingTimer)
+    planLoadingTimer = null
+  }
+}
+
 function formatTime(time) {
   if (!time) return ''
   const date = new Date(time)
@@ -309,7 +636,13 @@ function formatTime(time) {
 }
 
 function renderMarkdown(text) {
-  return marked(text || '')
+  if (!text) return ''
+  // 1. 清理 SSE 协议残留字符
+  const cleaned = cleanStreamText(text)
+  // 2. 修复流式不完整表格（让 marked 能正确解析）
+  const repaired = repairStreamingTables(cleaned)
+  // 3. 调用 marked 渲染
+  return marked(repaired)
 }
 
 function scrollToBottom() {
@@ -327,6 +660,37 @@ function scrollToBottom() {
   height: 100vh;
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   overflow: hidden;
+}
+
+/* Markdown表格样式 */
+.bubble :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 14px;
+}
+
+.bubble :deep(th) {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 10px 12px;
+  text-align: left;
+  font-weight: 600;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.bubble :deep(td) {
+  padding: 8px 12px;
+  border: 1px solid #e0e0e0;
+  background: white;
+}
+
+.bubble :deep(tr:nth-child(even) td) {
+  background: #f8f9fa;
+}
+
+.bubble :deep(tr:hover td) {
+  background: #e8f4fd;
 }
 
 /* 侧边栏样式 */
@@ -828,5 +1192,97 @@ function scrollToBottom() {
 
 .bubble :deep(a:hover) {
   text-decoration: underline;
+}
+
+/* 地图淡入过渡动画 */
+.map-fade-enter-active {
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+.map-fade-leave-active {
+  transition: opacity 0.2s ease;
+}
+.map-fade-enter-from {
+  opacity: 0;
+  transform: translateY(10px);
+}
+.map-fade-leave-to {
+  opacity: 0;
+}
+
+/* ===== 行程计划加载状态样式 ===== */
+.plan-loading-bubble {
+  min-height: 140px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.plan-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 0;
+}
+
+.plan-loading-icon {
+  font-size: 40px;
+  animation: planeFly 2s ease-in-out infinite;
+}
+
+@keyframes planeFly {
+  0%, 100% { transform: translateX(0) translateY(0) rotate(0deg); }
+  25% { transform: translateX(8px) translateY(-6px) rotate(5deg); }
+  50% { transform: translateX(16px) translateY(0) rotate(0deg); }
+  75% { transform: translateX(8px) translateY(-4px) rotate(-3deg); }
+}
+
+.plan-loading-text {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.plan-loading-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #333;
+}
+
+.plan-loading-hint {
+  font-size: 13px;
+  color: #999;
+  transition: all 0.3s ease;
+}
+
+.plan-loading-dots {
+  display: flex;
+  gap: 5px;
+}
+
+.plan-loading-dots span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  animation: dotPulse 1.4s ease-in-out infinite;
+}
+
+.plan-loading-dots span:nth-child(1) { animation-delay: 0s; }
+.plan-loading-dots span:nth-child(2) { animation-delay: 0.15s; }
+.plan-loading-dots span:nth-child(3) { animation-delay: 0.3s; }
+.plan-loading-dots span:nth-child(4) { animation-delay: 0.45s; }
+.plan-loading-dots span:nth-child(5) { animation-delay: 0.6s; }
+
+@keyframes dotPulse {
+  0%, 80%, 100% {
+    transform: scale(0.6);
+    opacity: 0.4;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
 }
 </style>

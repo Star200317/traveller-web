@@ -29,7 +29,7 @@ app.use(ElementPlus)
 router.beforeEach((to, from, next) => {
   const userStore = useUserStore()
   const token = userStore.token || localStorage.getItem('token')
-  
+
   if (to.meta.requiresAuth && !token) {
     next('/login')
   } else if (to.path === '/login' && token) {
@@ -38,5 +38,22 @@ router.beforeEach((to, from, next) => {
     next()
   }
 })
+
+// 高德地图 JS API 预加载（在应用启动时静默加载，打开地图页面时直接使用）
+const AMAP_KEY = '051b40dc66f3b5e522738f026a027916'
+if (!window.AMap) {
+  const script = document.createElement('script')
+  script.src = `https://webapi.amap.com/maps?v=2.0&key=${AMAP_KEY}&callback=onAmapPreload`
+  script.onload = () => {
+    console.log('[main] 高德地图 API 预加载完成')
+  }
+  script.onerror = () => {
+    console.warn('[main] 高德地图 API 预加载失败，将在地图页面重新加载')
+  }
+  window.onAmapPreload = () => {
+    console.log('[main] 高德地图 API 预加载回调触发')
+  }
+  document.head.appendChild(script)
+}
 
 app.mount('#app')

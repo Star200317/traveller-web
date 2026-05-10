@@ -32,15 +32,15 @@
       <div class="legend-title">📅 行程安排</div>
       <div class="legend-content">
         <div 
-          v-for="(pl, idx) in mapData.polylines" 
-          :key="idx" 
+          v-for="day in dayList" 
+          :key="day.day" 
           class="legend-item"
-          :class="{ active: activeDay === pl.day }"
-          @click="highlightDay(pl.day)"
+          :class="{ active: activeDay === day.day }"
+          @click="highlightDay(day.day)"
         >
-          <span class="legend-dot" :style="{ background: pl.color }"></span>
-          <span class="legend-text">第 {{ pl.day }} 天</span>
-          <span class="legend-count">{{ getDayPointCount(pl.day) }} 个景点</span>
+          <span class="legend-dot" :style="{ background: day.color }"></span>
+          <span class="legend-text">第 {{ day.day }} 天</span>
+          <span class="legend-count">{{ getDayPointCount(day.day) }} 个景点</span>
         </div>
       </div>
     </div>
@@ -78,11 +78,12 @@
 </template>
 
 <script setup>
-import { onMounted, watch, ref, nextTick } from 'vue'
+import { onMounted, watch, ref, nextTick, computed } from 'vue'
 import { Plus, Minus, Location, ArrowDown } from '@element-plus/icons-vue'
 
 const props = defineProps({
-  mapData: { type: Object, required: true }
+  mapData: { type: Object, required: true },
+  ready: { type: Boolean, default: true }  // 容器是否已就绪（尺寸>0）
 })
 
 const mapRef = ref(null)
@@ -94,11 +95,30 @@ const activeDay = ref(null)
 const activeMarker = ref(null)
 const panelCollapsed = ref(false)
 
-onMounted(() => {
-  nextTick(() => {
-    initMap()
-  })
+// 图例用的去重天数列表（每天一条，避免 polylines 多段路线导致重复显示）
+const dayList = computed(() => {
+  if (!props.mapData?.polylines) return []
+  const seen = new Set()
+  const result = []
+  for (const pl of props.mapData.polylines) {
+    if (!seen.has(pl.day)) {
+      seen.add(pl.day)
+      result.push({ day: pl.day, color: pl.color })
+    }
+  }
+  return result
 })
+
+onMounted(() => {
+  // 不再立即初始化，等待父组件通知 ready
+})
+
+// 监听 ready 状态变化：当容器就绪后才开始加载地图
+watch(() => props.ready, (isReady) => {
+  if (isReady && !mapInstance) {
+    nextTick(() => initMap())
+  }
+}, { immediate: true })  // immediate: 如果挂载时已经是 ready，立即执行
 
 watch(() => props.mapData, (newVal) => {
   if (newVal && mapInstance) renderMapData()
@@ -110,26 +130,30 @@ function initMap() {
   loading.value = true
 
   const amapKey = import.meta.env.VITE_AMAP_KEY
+  console.log('[AMap] 开始初始化地图, VITE_AMAP_KEY已配置:', !!amapKey && amapKey !== 'your-amap-js-key')
   if (!amapKey || amapKey === 'your-amap-js-key') {
-    console.error('[AMap] 高德地图API Key未配置')
+    console.error('[AMap] 高德地图API Key未配置或使用了默认值')
     loading.value = false
     return
   }
 
   if (!window.AMap) {
+    console.log('[AMap] 高德API未加载，开始动态加载脚本...')
     const script = document.createElement('script')
     script.src = `https://webapi.amap.com/maps?v=2.0&key=${amapKey}&callback=onAmapLoad`
     script.onerror = () => {
-      console.error('[AMap] 高德地图脚本加载失败')
+      console.error('[AMap] 高德地图脚本加载失败，请检查API Key是否有效、网络是否可访问 webapi.amap.com')
       loading.value = false
     }
     document.head.appendChild(script)
     window.onAmapLoad = () => {
+      console.log('[AMap] 高德地图API加载成功，开始创建地图实例')
       createMap()
       isMapLoading = false
       loading.value = false
     }
   } else {
+    console.log('[AMap] 高德API已存在，直接创建地图实例')
     createMap()
     isMapLoading = false
     loading.value = false
@@ -138,33 +162,73 @@ function initMap() {
 
 function createMap() {
   const center = props.mapData.center || { lat: 39.9, lng: 116.4 }
-  mapInstance = new window.AMap.Map(mapId, {
-    zoom: props.mapData.zoom || 12,
-    center: [center.lng, center.lat],
-    viewMode: '2D',
-    mapStyle: 'amap://styles/whitesmoke'
-  })
+  console.log('[MapView] 创建地图实例, center:', center, 'zoom:', props.mapData.zoom || 12)
+  try {
+    mapInstance = new window.AMap.Map(mapId, {
+      zoom: props.mapData.zoom || 12,
+      center: [center.lng, center.lat],
+      viewMode: '2D',
+      mapStyle: 'amap://styles/whitesmoke'
+    })
+    console.log('[MapView] 地图实例创建成功, mapInstance:', !!mapInstance)
+  } catch (e) {
+    console.error('[MapView] 地图实例创建失败:', e)
+    loading.value = false
+    return
+  }
   renderMapData()
 }
 
 function renderMapData() {
-  if (!mapInstance || !props.mapData) return
+  if (!mapInstance) {
+    console.warn('[MapView] renderMapData: mapInstance 不存在，跳过渲染')
+    return
+  }
+  if (!props.mapData) {
+    console.warn('[MapView] renderMapData: mapData 为空，跳过渲染')
+    return
+  }
 
+  console.log('[MapView] renderMapData 开始, mapData:', props.mapData)
   mapInstance.clearMap()
   const { markers = [], polylines = [] } = props.mapData
+  
+  console.log(`[MapView] 共有 ${markers.length} 个标记点, ${polylines.length} 条路线`)
+  if (markers.length === 0 && polylines.length === 0) {
+    console.warn('[MapView] ⚠️ markers 和 polylines 均为空，地图上不会有任何内容！请检查后端返回的 plan.mapData 数据')
+  }
+  markers.forEach((m, idx) => {
+    console.log(`[MapView] 标记 ${idx}: name=${m.name}, lat=${m.lat}, lng=${m.lng}, day=${m.day}, type=${m.type}`)
+  })
 
   // 添加标记点
   markers.forEach((m, idx) => {
+    // 跳过无效坐标的标记
+    if (!m.lat || !m.lng || m.lat === 0 || m.lng === 0) {
+      console.warn(`[MapView] 跳过无效坐标标记: ${m.name}, lat=${m.lat}, lng=${m.lng}`)
+      return
+    }
+    // 根据类型选择颜色：酒店用紫色，景点用当天路线颜色
+    const markerColor = m.type === 'hotel' ? '#8B5CF6' : m.color
+    
+    // 动态生成标记图标
+    const markerIconSvg = `
+      <svg width="32" height="40" viewBox="0 0 32 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M16 0C7.16 0 0.716 6.4 0 14.4C0 22.4 16 40 16 40C16 40 32 22.4 32 14.4C31.284 6.4 24.84 0 16 0Z" fill="${markerColor}"/>
+        <circle cx="16" cy="14" r="6" fill="white"/>
+      </svg>
+    `
+    
     const marker = new window.AMap.Marker({
       position: [m.lng, m.lat],
       title: m.name,
       label: {
-        content: `<div class="map-marker-label" style="background:${m.color}">Day${m.day}-${m.order}</div>`,
+        content: `<div class="map-marker-label" style="background:${markerColor}">${m.type === 'hotel' ? '酒店' : 'Day' + m.day + '-' + m.order}</div>`,
         offset: new window.AMap.Pixel(0, -35)
       },
       icon: new window.AMap.Icon({
         size: new window.AMap.Size(32, 40),
-        image: 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCAzMiA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8cGF0aCBkPSJNMTYgMEM3LjE2IDAgMC43MTYgNi40IDAgMTQuNEMwIDIyLjQgMTYgNDAgMTYgNDBDMTYgNDAgMzIgMjIuNCAzMiAxNC40QzMxLjI4NCA2LjQgMjQuODQgMCAxNiAwWiIgZmlsbD0idXJsKCNncmFkaWVudCkiLz4KICA8ZGVmcz4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iZ3JhZGllbnQiIHgxPSIwJSIgeTE9IjAlIiB4Mj0iMTAwJSIgeTI9IjEwMCUiPgogICAgICA8c3RvcCBvZmZzZXQ9IjAlIiBzdG9wLWNvbG9yPSIjNjY3ZWVhIi8+CiAgICAgIDxzdG9wIG9mZnNldD0iMTAwJSIgc3RvcC1jb2xvcj0iIzc2NGJhMiIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICA8L2RlZnM+Cjwvc3ZnPg==',
+        image: 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(markerIconSvg))),
         imageSize: new window.AMap.Size(32, 40)
       })
     })
@@ -196,10 +260,21 @@ function renderMapData() {
   })
 
   // 添加路线
-  polylines.forEach(pl => {
+  polylines.forEach((pl, idx) => {
+    // 跳过点数不足2个的路线（无法构成线段）
+    if (!pl.points || pl.points.length < 2) {
+      console.warn(`[MapView] 跳过无效路线段 #${idx}: 点数不足, day=${pl.day}`)
+      return
+    }
     const path = pl.points.map(p => [p.lng, p.lat])
+    // 再次过滤无效坐标点
+    const validPath = path.filter(([lng, lat]) => lng && lat && lng !== 0 && lat !== 0)
+    if (validPath.length < 2) {
+      console.warn(`[MapView] 跳过无效路线段 #${idx}: 有效点数不足, day=${pl.day}`)
+      return
+    }
     const polyline = new window.AMap.Polyline({
-      path,
+      path: validPath,
       strokeColor: pl.color,
       strokeWeight: 5,
       strokeOpacity: 0.8,
@@ -248,7 +323,8 @@ function focusOnMarker(idx) {
 
 function getDayPointCount(day) {
   if (!props.mapData?.markers) return 0
-  return props.mapData.markers.filter(m => m.day === day).length
+  // 只统计 type=attraction 的标记，不含酒店和餐食
+  return props.mapData.markers.filter(m => m.day === day && m.type === 'attraction').length
 }
 </script>
 
