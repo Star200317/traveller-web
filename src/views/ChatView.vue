@@ -34,7 +34,13 @@
       </div>
       
       <div class="sidebar-footer">
-        <div class="user-info">
+        <div class="footer-links">
+          <div class="footer-link" @click="$router.push('/profile')">
+            <el-icon><User /></el-icon>
+            <span>个人中心</span>
+          </div>
+        </div>
+        <div class="user-info" @click="$router.push('/profile')">
           <el-avatar :size="32" :src="userStore.userInfo?.avatar" />
           <span>{{ userStore.userInfo?.username || '游客' }}</span>
         </div>
@@ -50,8 +56,7 @@
           <span>AI 旅游向导</span>
         </div>
         <div class="header-actions">
-          <el-button text :icon="Share" @click="shareChat">分享</el-button>
-          <el-button text :icon="Setting" @click="openSettings">设置</el-button>
+          <el-button text :icon="Location" @click="goToGenerate">生成计划</el-button>
         </div>
       </div>
 
@@ -192,7 +197,7 @@
 
 <script setup>
 import { ref, onMounted, nextTick, watch, computed } from 'vue'
-import { Plus, Delete, ChatDotRound, Compass, Share, Setting, Promotion } from '@element-plus/icons-vue'
+import { Plus, Delete, ChatDotRound, Compass, Promotion, Location, User } from '@element-plus/icons-vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { marked } from 'marked'
 
@@ -564,12 +569,8 @@ async function openFullMap() {
   }
 }
 
-function shareChat() {
-  // 分享功能
-}
-
-function openSettings() {
-  // 设置功能
+function goToGenerate() {
+  router.push('/generate')
 }
 
 /**
@@ -799,6 +800,27 @@ function scrollToBottom() {
 .sidebar-footer {
   padding: 16px;
   border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.footer-links {
+  margin-bottom: 12px;
+}
+
+.footer-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #666;
+  font-size: 14px;
+}
+
+.footer-link:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: #333;
 }
 
 .user-info {

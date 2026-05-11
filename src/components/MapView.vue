@@ -83,7 +83,7 @@ import { Plus, Minus, Location, ArrowDown } from '@element-plus/icons-vue'
 
 const props = defineProps({
   mapData: { type: Object, required: true },
-  ready: { type: Boolean, default: true }  // 容器是否已就绪（尺寸>0）
+  ready: { type: Boolean, default: true }
 })
 
 const mapRef = ref(null)
@@ -179,7 +179,7 @@ function createMap() {
   renderMapData()
 }
 
-function renderMapData() {
+async function renderMapData() {
   if (!mapInstance) {
     console.warn('[MapView] renderMapData: mapInstance 不存在，跳过渲染')
     return
@@ -196,18 +196,46 @@ function renderMapData() {
   console.log(`[MapView] 共有 ${markers.length} 个标记点, ${polylines.length} 条路线`)
   if (markers.length === 0 && polylines.length === 0) {
     console.warn('[MapView] ⚠️ markers 和 polylines 均为空，地图上不会有任何内容！请检查后端返回的 plan.mapData 数据')
+    return
   }
-  markers.forEach((m, idx) => {
-    console.log(`[MapView] 标记 ${idx}: name=${m.name}, lat=${m.lat}, lng=${m.lng}, day=${m.day}, type=${m.type}`)
-  })
 
-  // 添加标记点
-  markers.forEach((m, idx) => {
-    // 跳过无效坐标的标记
-    if (!m.lat || !m.lng || m.lat === 0 || m.lng === 0) {
-      console.warn(`[MapView] 跳过无效坐标标记: ${m.name}, lat=${m.lat}, lng=${m.lng}`)
+  // 直接使用后端返回的坐标（后端 buildMapData 已通过 enrichPreciseAddress 确保坐标有效）
+  // 只对所有坐标无效的点做 POI 搜索兜底
+  const markersWithCoords = await Promise.all(
+    markers.map(async (m, idx) => {
+      const lat = m.lat || 0
+      const lng = m.lng || 0
+      
+      // 坐标有效，直接使用
+      if (lat !== 0 && lng !== 0) {
+        return { ...m, lng: lng, lat: lat }
+      }
+      
+      // 坐标无效，尝试 POI 搜索兜底
+      console.warn(`[MapView] 标记 ${m.name} 坐标无效，尝试 POI 搜索...`)
+      try {
+        const result = await poiSearch(m.name, m.address, '')
+        if (result) {
+          return { ...m, lng: result.lng, lat: result.lat, address: result.address || m.address }
+        }
+      } catch (e) {
+        console.warn(`[MapView] POI搜索失败: ${m.name}`, e)
+      }
+      
+      // 都失败，返回一个标记（坐标为0，后续会被跳过）
+      return { ...m, lng: 0, lat: 0 }
+    })
+  )
+  
+  // 添加标记点（跳过坐标无效的点）
+  let validMarkerCount = 0
+  markersWithCoords.forEach((m, idx) => {
+    // 跳过坐标无效的点（0,0 是"空岛"，在非洲附近）
+    if (!m.lng || !m.lat || m.lng === 0 || m.lat === 0) {
+      console.warn(`[MapView] 跳过无效坐标的标记 #${idx}: ${m.name}, lng=${m.lng}, lat=${m.lat}`)
       return
     }
+    validMarkerCount++
     // 根据类型选择颜色：酒店用紫色，景点用当天路线颜色
     const markerColor = m.type === 'hotel' ? '#8B5CF6' : m.color
     
@@ -237,17 +265,25 @@ function renderMapData() {
     
     marker.on('click', () => {
       activeMarker.value = idx
+      // 获取类型图标
+      const typeIcon = m.type === 'hotel' ? '🏨' : (m.type === 'meal' || m.type === 'restaurant' ? '🍽️' : '🏛️')
+      const typeName = m.type === 'hotel' ? '酒店' : (m.type === 'meal' || m.type === 'restaurant' ? '餐厅' : '景点')
+
       const infoWindow = new window.AMap.InfoWindow({
         content: `
           <div class="map-info-window">
             <div class="info-header" style="background: ${m.color}">
+              <span class="info-type">${typeIcon} ${typeName}</span>
               <span class="info-day">Day ${m.day}</span>
-              <span class="info-order">#${m.order}</span>
             </div>
             <div class="info-body">
               <h4>${m.name}</h4>
-              <p class="info-address">${m.address || '暂无地址信息'}</p>
-              <p class="info-desc">${m.description || ''}</p>
+              <p class="info-address">📍 ${m.address || '暂无地址信息'}</p>
+              ${m.description ? `<p class="info-desc">${m.description}</p>` : ''}
+              ${m.price ? `<p class="info-price">💰 ${m.price}</p>` : ''}
+              <div class="info-actions">
+                <button onclick="window.open('https://uri.amap.com/navigation?to=${m.lng},${m.lat},${encodeURIComponent(m.name)}&mode=car&callnative=1', '_blank')" class="nav-btn">🧭 导航</button>
+              </div>
             </div>
           </div>
         `,
@@ -259,38 +295,212 @@ function renderMapData() {
     mapInstance.add(marker)
   })
 
-  // 添加路线
-  polylines.forEach((pl, idx) => {
-    // 跳过点数不足2个的路线（无法构成线段）
+  // 添加路线（使用POI搜索后的坐标）
+  const polylinesWithCoords = polylines.map(pl => {
     if (!pl.points || pl.points.length < 2) {
-      console.warn(`[MapView] 跳过无效路线段 #${idx}: 点数不足, day=${pl.day}`)
-      return
+      console.warn(`[MapView] 跳过无效路线段: day=${pl.day}, 点数不足`)
+      return null
     }
-    const path = pl.points.map(p => [p.lng, p.lat])
-    // 再次过滤无效坐标点
-    const validPath = path.filter(([lng, lat]) => lng && lat && lng !== 0 && lat !== 0)
-    if (validPath.length < 2) {
-      console.warn(`[MapView] 跳过无效路线段 #${idx}: 有效点数不足, day=${pl.day}`)
-      return
-    }
-    const polyline = new window.AMap.Polyline({
-      path: validPath,
-      strokeColor: pl.color,
-      strokeWeight: 5,
-      strokeOpacity: 0.8,
-      lineJoin: 'round',
-      showDir: true,
-      dirColor: '#fff',
-      isOutline: true,
-      outlineColor: 'rgba(0,0,0,0.2)',
-      borderWeight: 1
+    
+    // 为路线中的每个点查找POI坐标
+    const pointsWithCoords = pl.points.map(p => {
+      if (p.lng && p.lat && p.lng !== 0 && p.lat !== 0) {
+        return p
+      }
+      // 如果路线点没有坐标，尝试从markersWithCoords中查找
+      const found = markersWithCoords.find(m => m.name === p.name && m.day === p.day)
+      if (found) {
+        return { ...p, lng: found.lng, lat: found.lat }
+      }
+      // 如果找不到，使用默认坐标
+      const defaultCoord = getDefaultCoord(p.city || '厦门')
+      return { ...p, lng: defaultCoord.lng, lat: defaultCoord.lat }
     })
-    mapInstance.add(polyline)
-  })
+    
+    return { ...pl, points: pointsWithCoords }
+  }).filter(pl => pl !== null)
 
-  if (markers.length > 0) {
+  // 添加路线（直接使用后端已通过高德API规划好的路径点坐标画线）
+  // 如果后端返回的 points 只有2个点（说明后端路线规划失败，只有起终点），则前端重新调用高德Driving API获取真实路线
+  await renderRoutes(polylinesWithCoords)
+
+
+  if (markersWithCoords.length > 0) {
     mapInstance.setFitView(null, false, [50, 50, 50, 50])
   }
+}
+
+// 【新增】高德POI搜索函数
+function poiSearch(name, address, city) {
+  return new Promise((resolve, reject) => {
+    if (!window.AMap) {
+      reject(new Error('高德地图API未加载'))
+      return
+    }
+
+    const keyword = name || address || ''
+    const searchCity = city || ''
+    
+    console.log(`[MapView] POI搜索: keyword=${keyword}, city=${searchCity}`)
+    
+    window.AMap.plugin('AMap.PlaceSearch', () => {
+      const placeSearch = new window.AMap.PlaceSearch({
+        city: searchCity,
+        pageSize: 1,  // 只要第一个结果
+        pageIndex: 1,
+        citylimit: false,  // 不过滤城市，允许搜索全国
+      })
+      
+      placeSearch.search(keyword, (status, result) => {
+        if (status === 'complete' && result.info === 'OK') {
+          const poi = result.poiList.pois[0]
+          if (poi) {
+            console.log(`[MapView] POI搜索成功: ${keyword} → ${poi.name}, (${poi.location.lng}, ${poi.location.lat})`)
+            resolve({
+              lng: poi.location.lng,
+              lat: poi.location.lat,
+              address: poi.address || address
+            })
+          } else {
+            console.warn(`[MapView] POI搜索无结果: ${keyword}`)
+            resolve(null)
+          }
+        } else {
+          console.warn(`[MapView] POI搜索失败: ${keyword}, status=${status}, info=${result.info}`)
+          resolve(null)
+        }
+      })
+    })
+  })
+}
+
+// 【新增】获取默认坐标（城市中心）
+function getDefaultCoord(city) {
+  const cityCenters = {
+    '北京': { lat: 39.9042, lng: 116.4074 },
+    '上海': { lat: 31.2304, lng: 121.4737 },
+    '广州': { lat: 23.1291, lng: 113.2644 },
+    '深圳': { lat: 22.5431, lng: 114.0579 },
+    '厦门': { lat: 24.4798, lng: 118.0894 },
+    '三亚': { lat: 18.2528, lng: 109.5120 },
+    '昆明': { lat: 25.0389, lng: 102.7183 },
+    '大理': { lat: 25.6065, lng: 100.2676 },
+    '丽江': { lat: 26.8721, lng: 100.2299 },
+    '成都': { lat: 30.5728, lng: 104.0668 },
+    '杭州': { lat: 30.2741, lng: 120.1551 },
+    '西安': { lat: 34.3416, lng: 108.9398 }
+  }
+  
+  return cityCenters[city] || cityCenters['厦门']  // 默认厦门
+}
+
+// 渲染路线：将所有 polylines 中的点全部打平，按天序排列，统一连线
+async function renderRoutes(polylinesWithCoords) {
+  // 加载 Driving 插件（只需一次）
+  await new Promise((resolve) => {
+    window.AMap.plugin('AMap.Driving', () => resolve())
+  })
+
+  // 将所有 polylines 中的点全部收集起来（只保留有坐标的点）
+  const allPoints = []
+  for (const pl of polylinesWithCoords) {
+    const points = (pl.points || []).filter(p => p.lng && p.lat && p.lng !== 0 && p.lat !== 0)
+    for (const p of points) {
+      allPoints.push({ ...p, _day: pl.day, _color: pl.color })
+    }
+  }
+
+  if (allPoints.length < 2) return
+
+  // 去重：相同坐标的点只保留第一个（避免后端返回的路径中间点干扰）
+  const uniquePoints = []
+  const seen = new Set()
+  for (const p of allPoints) {
+    const key = p.lng.toFixed(6) + ',' + p.lat.toFixed(6)
+    if (!seen.has(key)) {
+      seen.add(key)
+      uniquePoints.push(p)
+    }
+  }
+
+  // 按天排序，同一天内按出现顺序保持原序
+  uniquePoints.sort((a, b) => (a._day || 0) - (b._day || 0))
+
+  console.log('[MapView] renderRoutes: 总点数=' + uniquePoints.length + ', points=', uniquePoints.map(p => (p.name || 'unnamed') + '(day' + (p._day || '?') + ')'))
+
+  // 依次连线（相邻两点调用一次 Driving API）
+  for (let i = 0; i < uniquePoints.length - 1; i++) {
+    const start = uniquePoints[i]
+    const end = uniquePoints[i + 1]
+    // 用起点的颜色和天信息
+    console.log('[MapView] 画线: ' + (start.name || 'unnamed') + ' -> ' + (end.name || 'unnamed'))
+    await drawDrivingRoute(start, end, start._color, start._day)
+  }
+}
+
+// 调用高德 Driving API 规划两点之间的真实道路路线并画线
+function drawDrivingRoute(start, end, color, day) {
+  return new Promise((resolve) => {
+    const driving = new window.AMap.Driving({
+      policy: window.AMap.DrivingPolicy.LEAST_TIME,
+      map: null
+    })
+
+    driving.search(
+      [start.lng, start.lat],
+      [end.lng, end.lat],
+      (status, result) => {
+        if (status === 'complete' && result.info === 'OK' && result.routes && result.routes.length > 0) {
+          const route = result.routes[0]
+          // 从 route.steps 中提取所有路径坐标点（step.polyline 是 "lng,lat;lng,lat;..." 格式）
+          const path = []
+          for (const step of (route.steps || [])) {
+            if (step.polyline) {
+              const coords = step.polyline.split(';').map(s => {
+                const [lng, lat] = s.split(',').map(Number)
+                return [lng, lat]
+              })
+              path.push(...coords)
+            }
+          }
+
+          if (path.length >= 2) {
+            const polyline = new window.AMap.Polyline({
+              path: path,
+              strokeColor: color,
+              strokeWeight: 5,
+              strokeOpacity: 0.8,
+              lineJoin: 'round',
+              showDir: true,
+              dirColor: '#fff',
+              isOutline: true,
+              outlineColor: 'rgba(0,0,0,0.2)',
+              borderWeight: 1
+            })
+            mapInstance.add(polyline)
+            console.log('[MapView] 真实路线绘制成功: day=' + day + ' ' + (start.name || '') + '->' + (end.name || '') + ', ' + path.length + '个路径点')
+            resolve()
+            return
+          }
+        }
+
+        // 规划失败，降级为直线
+        console.warn('[MapView] Driving规划失败，降级为直线: day=' + day, status, result ? result.info : '')
+        const fallbackPath = [[start.lng, start.lat], [end.lng, end.lat]]
+        const polyline = new window.AMap.Polyline({
+          path: fallbackPath,
+          strokeColor: color,
+          strokeWeight: 4,
+          strokeOpacity: 0.5,
+          lineJoin: 'round',
+          showDir: true,
+          dirColor: '#fff'
+        })
+        mapInstance.add(polyline)
+        resolve()
+      }
+    )
+  })
 }
 
 function zoomIn() {

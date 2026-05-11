@@ -123,12 +123,13 @@
         </div>
       </div>
 
-      <!-- 地图区域 -->
-      <div class="map-container">
-        <MapView 
-          v-if="filteredMapData && filteredMapData.markers?.length > 0" 
-          :mapData="filteredMapData" 
-        />
+        <!-- 地图区域 -->
+        <div class="map-container" ref="mapContainerRef">
+          <MapView 
+            v-if="filteredMapData && filteredMapData.markers?.length > 0" 
+            :mapData="filteredMapData"
+            :ready="mapContainerReady"
+          />
         
         <div v-else-if="loading" class="loading-state">
           <el-loading-spinner />
@@ -199,6 +200,25 @@ const showRawData = ref(false)
 const rawData = ref(null)
 const sidebarCollapsed = ref(false)
 const selectedDay = ref(null)
+const mapContainerRef = ref(null)
+const mapContainerReady = ref(false)
+
+// 监听地图容器尺寸，ready 后通知 MapView 初始化
+onMounted(() => {
+  if (mapContainerRef.value) {
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect
+        if (width > 0 && height > 0) {
+          mapContainerReady.value = true
+          observer.disconnect()
+          break
+        }
+      }
+    })
+    observer.observe(mapContainerRef.value)
+  }
+})
 
 // 前端内存缓存：避免同一 planId 重复请求后端
 const mapDataCache = new Map()
@@ -220,10 +240,23 @@ function processPlanData(plan) {
     daysCount: plan.planContent?.days?.length ?? 'N/A'
   }, null, 2))
 
-  if (plan.mapData && Array.isArray(plan.mapData.markers) && plan.mapData.markers.length > 0) {
+  // 处理 mapData：可能是对象，也可能是 JSON 字符串
+  let mapData = plan.mapData
+  if (typeof mapData === 'string') {
+    try {
+      mapData = JSON.parse(mapData)
+      console.log('[MapPage] mapData 从 JSON 字符串解析成功')
+    } catch (e) {
+      console.warn('[MapPage] mapData JSON 解析失败:', e)
+      mapData = null
+    }
+  }
+  
+  // 检查 mapData 是否有效
+  if (mapData && Array.isArray(mapData.markers) && mapData.markers.length > 0) {
     // 后端已生成有效 mapData，直接使用（最快路径）
-    console.log('[MapPage] ✅ 使用后端已存储的 mapData, markers=', plan.mapData.markers.length)
-    return plan.mapData
+    console.log('[MapPage] ✅ 使用后端已存储的 mapData, markers=', mapData.markers.length)
+    return mapData
   }
   
   // 后端 mapData 为空或无效，尝试前端实时解析 planContent

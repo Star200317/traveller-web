@@ -7,6 +7,8 @@ import App from './App.vue'
 import ChatView from './views/ChatView.vue'
 import LoginView from './views/LoginView.vue'
 import MapViewPage from './views/MapViewPage.vue'
+import PlanGenerateView from './views/PlanGenerateView.vue'
+import ProfileView from './views/ProfileView.vue'
 import { useUserStore } from './stores/user'
 
 const router = createRouter({
@@ -14,7 +16,10 @@ const router = createRouter({
   routes: [
     { path: '/login', component: LoginView },
     { path: '/', component: ChatView, meta: { requiresAuth: true } },
-    { path: '/map/:planId', component: MapViewPage, meta: { requiresAuth: true } }
+    { path: '/map/:planId', component: MapViewPage, meta: { requiresAuth: true } },
+    { path: '/generate', component: PlanGenerateView, meta: { requiresAuth: true } },
+    { path: '/plan/:planId', component: PlanGenerateView, meta: { requiresAuth: true } },
+    { path: '/profile', component: ProfileView, meta: { requiresAuth: true } }
   ]
 })
 
