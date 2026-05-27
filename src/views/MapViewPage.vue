@@ -186,6 +186,7 @@ import {
 } from '@element-plus/icons-vue'
 import MapView from '../components/MapView.vue'
 import request from '../utils/request'
+import { getPlanDTO, getDrivingRoute } from '../api/plan'
 
 const route = useRoute()
 const router = useRouter()
@@ -220,61 +221,75 @@ onMounted(() => {
   }
 })
 
+const DAY_ROUTE_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#14B8A6', '#F97316', '#EC4899']
+
 // 前端内存缓存：避免同一 planId 重复请求后端
 const mapDataCache = new Map()
 
-// 从后端拿到 plan 数据后，处理 mapData
-function processPlanData(plan) {
-  if (!plan) {
-    return { markers: [], polylines: [] }
-  }
-  
-  console.log('[MapPage] 原始 plan 数据:', JSON.stringify({
-    id: plan.id,
-    hasMapData: !!plan.mapData,
-    mapDataType: typeof plan.mapData,
-    mapDataKeys: plan.mapData ? Object.keys(plan.mapData) : [],
-    hasPlanContent: !!plan.planContent,
-    planContentType: typeof plan.planContent,
-    planContentKeys: plan.planContent ? Object.keys(plan.planContent) : [],
-    daysCount: plan.planContent?.days?.length ?? 'N/A'
-  }, null, 2))
+function buildMarkersFromDto(dto) {
+  const dayIndexMap = new Map((dto.days || []).map((day, index) => [day.date, index + 1]))
 
-  // 处理 mapData：可能是对象，也可能是 JSON 字符串
-  let mapData = plan.mapData
-  if (typeof mapData === 'string') {
-    try {
-      mapData = JSON.parse(mapData)
-      console.log('[MapPage] mapData 从 JSON 字符串解析成功')
-    } catch (e) {
-      console.warn('[MapPage] mapData JSON 解析失败:', e)
-      mapData = null
-    }
+  return (dto.items || [])
+    .filter(item => item.longitude && item.latitude && item.dayDate)
+    .map(item => {
+      const day = dayIndexMap.get(item.dayDate) || 0
+      const color = DAY_ROUTE_COLORS[(day - 1 + DAY_ROUTE_COLORS.length) % DAY_ROUTE_COLORS.length]
+      return {
+        day,
+        order: item.sortOrder || 0,
+        name: item.name,
+        lat: item.latitude,
+        lng: item.longitude,
+        address: item.address || '',
+        color,
+        type: item.type || 'attraction'
+      }
+    })
+}
+
+async function buildPolylinesFromDto(dto) {
+  const polylines = []
+  const days = dto.days || []
+
+  for (let index = 0; index < days.length; index++) {
+    const day = days[index]
+    const color = DAY_ROUTE_COLORS[index % DAY_ROUTE_COLORS.length]
+    const orderedItems = (dto.items || [])
+      .filter(item => item.dayDate === day.date && item.longitude && item.latitude)
+      .sort((a, b) => (a.sortOrder || 999) - (b.sortOrder || 999))
+
+    if (orderedItems.length < 2) continue
+
+    const route = await getDrivingRoute(
+      orderedItems.map(item => ({
+        name: item.name,
+        lng: item.longitude,
+        lat: item.latitude
+      }))
+    )
+
+    const segments = route?.segments || []
+    segments.forEach(segment => {
+      const points = Array.isArray(segment.path)
+        ? segment.path.map(point => Array.isArray(point) ? { lng: point[0], lat: point[1] } : point)
+        : []
+      if (points.length > 1) {
+        polylines.push({
+          day: index + 1,
+          color,
+          points
+        })
+      }
+    })
   }
-  
-  // 检查 mapData 是否有效
-  if (mapData && Array.isArray(mapData.markers) && mapData.markers.length > 0) {
-    // 后端已生成有效 mapData，直接使用（最快路径）
-    console.log('[MapPage] ✅ 使用后端已存储的 mapData, markers=', mapData.markers.length)
-    return mapData
-  }
-  
-  // 后端 mapData 为空或无效，尝试前端实时解析 planContent
-  if (plan.planContent) {
-    console.log('[MapPage] ⚠️ 后端 mapData 无效，尝试前端解析 planContent')
-    const built = buildMapDataFromContent(plan.planContent)
-    console.log('[MapPage] 前端解析结果: markers=', built.markers.length, 'polylines=', built.polylines.length)
-    
-    // 如果前端解析也失败（markers=0），尝试从 planContent 文本中提取表格数据
-    if (built.markers.length === 0 && typeof plan.planContent === 'object') {
-      console.log('[MapPage] 标准解析无结果，尝试深度提取...')
-      return deepExtractMapData(plan.planContent)
-    }
-    
-    return built
-  }
-  
-  return { markers: [], polylines: [] }
+
+  return polylines
+}
+
+async function buildMapDataFromDto(dto) {
+  const markers = buildMarkersFromDto(dto)
+  const polylines = await buildPolylinesFromDto(dto)
+  return { markers, polylines }
 }
 
 // 根据筛选条件过滤地图数据
@@ -328,11 +343,13 @@ async function loadMapData() {
       return
     }
 
-    const plan = await request.get(`/plan/${planId.value}`)
-    console.log('[MapPage] 计划数据:', plan)
-    rawData.value = plan
+    const [plan, dto] = await Promise.all([
+      request.get(`/plan/${planId.value}`),
+      getPlanDTO(planId.value)
+    ])
+    rawData.value = { plan, dto }
 
-    if (!plan) {
+    if (!plan || !dto) {
       mapData.value = { markers: [], polylines: [] }
       return
     }
@@ -340,12 +357,11 @@ async function loadMapData() {
     planTitle.value = plan.title || '未命名计划'
     planInfo.value = {
       destination: plan.destination || '',
-      days: plan.days || 0,
+      days: dto.days?.length || 0,
       budget: plan.budget || 0
     }
 
-    // 使用 processPlanData 统一处理，优先用后端 mapData
-    const processed = processPlanData(plan)
+    const processed = await buildMapDataFromDto(dto)
     mapData.value = processed
 
     // 写入缓存
@@ -365,142 +381,12 @@ async function loadMapData() {
   }
 }
 
-function buildMapDataFromContent(content) {
-  if (!content || !content.days) return { markers: [], polylines: [] }
-
-  const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD']
-  const markers = []
-  const polylines = []
-
-  content.days.forEach((day, dayIdx) => {
-    const color = colors[dayIdx % colors.length]
-    const activities = day.activities || day.attractions || []
-    const points = []
-
-    // 支持两种字段名：latitude/longitude (AI原始) 或 lat/lng (后端转换后)
-    activities.forEach((act, actIdx) => {
-      const lat = act.lat || act.latitude
-      const lng = act.lng || act.longitude
-      if (lat && lng && lat !== 0 && lng !== 0) {
-        markers.push({
-          day: day.day || dayIdx + 1,
-          order: actIdx + 1,
-          name: act.name,
-          lat: lat,
-          lng: lng,
-          address: act.address || '',
-          description: act.description || '',
-          color: color,
-          type: 'attraction'
-        })
-        points.push({ lat: lat, lng: lng })
-      } else {
-        console.log(`[MapPage] 跳过无坐标景点: ${act?.name}, lat=${lat}, lng=${lng}`)
-      }
-    })
-
-    // 餐食也作为标记点
-    ;(day.meals || []).forEach((meal) => {
-      const mLat = meal.lat || meal.latitude
-      const mLng = meal.lng || meal.longitude
-      if (mLat && mLng && mLat !== 0 && mLng !== 0) {
-        markers.push({
-          day: day.day || dayIdx + 1,
-          order: 999,
-          name: meal.name,
-          lat: mLat, lng: mLng,
-          address: meal.address || '',
-          color: color,
-          type: 'meal'
-        })
-      }
-    })
-
-    // 酒店
-    const hotel = day.hotel
-    if (hotel?.name) {
-      const hLat = hotel.lat || hotel.latitude
-      const hLng = hotel.lng || hotel.longitude
-      if (hLat && hLng && hLat !== 0 && hLng !== 0) {
-        markers.push({
-          day: day.day || dayIdx + 1,
-          order: 0,
-          name: hotel.name + ' (酒店)',
-          lat: hLat, lng: hLng,
-          address: hotel.address || '',
-          color: '#8B5CF6',
-          type: 'hotel'
-        })
-      }
-    }
-    
-    if (points.length > 1) {
-      polylines.push({
-        day: day.day || dayIdx + 1,
-        color: color,
-        points: points
-      })
-    }
-  })
-
-  return { markers, polylines }
-}
-
-/**
- * 深度提取：从 planContent 的各种嵌套格式中尝试提取坐标数据
- * 兜底方案：当标准解析返回空结果时调用
- */
-function deepExtractMapData(content) {
-  if (!content) return { markers: [], polylines: [] }
-
-  const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD']
-  const markers = []
-  const polylines = []
-
-  const days = content.days || content.data || content.plan || []
-  
-  days.forEach((day, dayIdx) => {
-    const color = colors[dayIdx % colors.length]
-    const dayNum = day.day || day.dayIndex || dayIdx + 1
-
-    // 尝试多个可能的字段名来获取活动列表
-    const activities = day.activities || day.attractions || day.items || day.spots || day.places ||
-      (Array.isArray(day) ? day : [])
-    
-    let linePoints = []
-
-    activities.forEach((item, idx) => {
-      if (!item?.name) return
-      
-      const lat = item.lat || item.latitude || item.y
-      const lng = item.lng || item.longitude || item.x
-
-      if (lat && lng && lat !== 0 && lng !== 0) {
-        markers.push({
-          day: dayNum, order: idx + 1, name: item.name,
-          address: item.address || '', description: item.description || item.introduction || '',
-          time: item.time || item.timeRange || '',
-          lat, lng, color, type: 'attraction'
-        })
-        linePoints.push({ lat, lng, name: item.name })
-      }
-    })
-
-    if (linePoints.length > 1) {
-      polylines.push({ day: dayNum, color, points: linePoints })
-    }
-  })
-
-  console.log('[MapPage] 深度提取结果: markers=', markers.length, ', polylines=', polylines.length)
-  return { markers, polylines }
-}
-
 function toggleDayFilter(day) {
   selectedDay.value = selectedDay.value === day ? null : day
 }
 
 function goBack() {
-  router.push('/')
+  router.push(`/plan/${planId.value}`)
 }
 
 function openInAMap() {

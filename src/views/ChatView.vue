@@ -208,7 +208,7 @@ marked.setOptions({
   tables: true   // 显式启用表格支持
 })
 import { useUserStore } from '@/stores/user'
-import request from '@/utils/request'
+import request, { getAccessToken } from '@/utils/request'
 import MapView from '@/components/MapView.vue'
 import { useRouter } from 'vue-router'
 
@@ -224,6 +224,7 @@ const msgListRef = ref(null)
 const currentMapData = ref(null)
 const embeddedMapRef = ref(null)  // 内嵌地图容器引用
 const mapReady = ref(false)        // 地图容器是否已就绪（尺寸>0）
+let planLoadingTimer = null
 
 // 行程计划块输出相关
 const isPlanOutput = computed(() => detectPlanOutput(streamBuffer.value))
@@ -318,7 +319,10 @@ async function fetchWithRetry(query, maxRetries = 3) {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       const url = `/api/chat/stream/${currentConvId.value}?message=${encodeURIComponent(query)}`
-      const response = await fetch(url)
+      const token = getAccessToken()
+      const response = await fetch(url, {
+        headers: token ? { Authorization: token } : {}
+      })
 
       if (!response.ok) {
         throw new Error(`请求失败: ${response.status}`)
@@ -332,7 +336,9 @@ async function fetchWithRetry(query, maxRetries = 3) {
         const { done, value } = await reader.read()
         
         // 解码当前chunk
-        sseBuffer += decoder.decode(value, { stream: !done })
+        if (value) {
+          sseBuffer += decoder.decode(value, { stream: !done })
+        }
         
         if (done) {
           // 流结束，处理剩余缓冲区
@@ -596,7 +602,6 @@ const PLAN_LOADING_STAGES = [
   '即将生成完整行程表...'
 ]
 let planLoadingStage = 0
-let planLoadingTimer = null
 
 /**
  * 启动行程加载提示轮换
@@ -653,6 +658,10 @@ function scrollToBottom() {
     }
   })
 }
+
+watch(currentConvId, () => {
+  stopPlanLoadingHints()
+})
 </script>
 
 <style scoped>

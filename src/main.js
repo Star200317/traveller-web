@@ -10,6 +10,7 @@ import MapViewPage from './views/MapViewPage.vue'
 import PlanGenerateView from './views/PlanGenerateView.vue'
 import ProfileView from './views/ProfileView.vue'
 import { useUserStore } from './stores/user'
+import { getAccessToken } from './utils/request'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -33,7 +34,7 @@ app.use(ElementPlus)
 // 路由守卫在 Pinia 初始化后设置
 router.beforeEach((to, from, next) => {
   const userStore = useUserStore()
-  const token = userStore.token || localStorage.getItem('token')
+  const token = userStore.token || getAccessToken()
 
   if (to.meta.requiresAuth && !token) {
     next('/login')
@@ -45,8 +46,8 @@ router.beforeEach((to, from, next) => {
 })
 
 // 高德地图 JS API 预加载（在应用启动时静默加载，打开地图页面时直接使用）
-const AMAP_KEY = '051b40dc66f3b5e522738f026a027916'
-if (!window.AMap) {
+const AMAP_KEY = import.meta.env.VITE_AMAP_KEY
+if (AMAP_KEY && AMAP_KEY !== 'your-amap-js-key' && !window.AMap) {
   const script = document.createElement('script')
   script.src = `https://webapi.amap.com/maps?v=2.0&key=${AMAP_KEY}&callback=onAmapPreload`
   script.onload = () => {

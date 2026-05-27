@@ -1,16 +1,27 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
-import { useUserStore } from '@/stores/user'
+
+const TOKEN_KEY = 'token'
+const USER_INFO_KEY = 'userInfo'
+
+export function getAccessToken() {
+  return localStorage.getItem(TOKEN_KEY) || ''
+}
+
+export function clearAuthStorage() {
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(USER_INFO_KEY)
+}
 
 const request = axios.create({
-  baseURL: '/api',
+  baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
   timeout: 30000
 })
 
 request.interceptors.request.use(config => {
-  const userStore = useUserStore()
-  if (userStore.token) {
-    config.headers['Authorization'] = userStore.token
+  const token = getAccessToken()
+  if (token) {
+    config.headers.Authorization = token
   }
   return config
 })
@@ -30,12 +41,11 @@ request.interceptors.response.use(
   err => {
     if (err.response?.status === 401) {
       ElMessage.error('请先登录')
-      // 清除token并跳转到登录页
-      localStorage.removeItem('token')
-      localStorage.removeItem('userInfo')
+      clearAuthStorage()
       window.location.href = '/login'
     } else {
-      ElMessage.error(err.message || '网络错误')
+      const message = err.response?.data?.message || err.message || '网络错误'
+      ElMessage.error(message)
     }
     return Promise.reject(err)
   }

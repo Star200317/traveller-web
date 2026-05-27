@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import request from '@/utils/request'
+import request, { clearAuthStorage } from '@/utils/request'
 
 export const useUserStore = defineStore('user', () => {
   const token = ref(localStorage.getItem('token') || '')
@@ -34,8 +34,7 @@ export const useUserStore = defineStore('user', () => {
     request.post('/auth/logout').finally(() => {
       token.value = ''
       userInfo.value = null
-      localStorage.removeItem('token')
-      localStorage.removeItem('userInfo')
+      clearAuthStorage()
     })
   }
 
